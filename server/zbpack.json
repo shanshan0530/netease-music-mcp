@@ -1,0 +1,4 @@
+{
+  "language": "python",
+  "start_command": "python3 server.py"
+}
