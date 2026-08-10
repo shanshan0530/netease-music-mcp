@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-import http.server, json, os, urllib.request, urllib.parse, threading, uuid, time
+import hmac, http.server, json, os, urllib.request, urllib.parse, threading, uuid, time
 from http.server import HTTPServer
 
 NETEASE_COOKIE = os.environ.get("NETEASE_COOKIE", "")
+MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "").strip()
 PORT = int(os.environ.get("MCP_PORT", "3456"))
 SESSION_ID = str(uuid.uuid4())
 
@@ -220,32 +221,69 @@ def handle_jsonrpc(body):
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
-        self.send_response(200)
+        self.send_response(204)
         self._cors()
         self.end_headers()
+
     def do_GET(self):
         if self.path == '/health':
-            self._json_response({"status": "ok", "tools": len(TOOLS)})
+            self._json_response({"status": "ok", "tools": len(TOOLS), "auth": "configured" if MCP_AUTH_TOKEN else "missing"})
         elif self.path.startswith('/sse'):
-            self._handle_sse()
+            if self._require_auth():
+                self._handle_sse()
         else:
             self.send_error(404)
+
     def do_POST(self):
         if self.path.startswith('/mcp') or self.path.startswith('/message'):
-            self._handle_mcp()
+            if self._require_auth():
+                self._handle_mcp()
         else:
             self.send_error(404)
+
     def _cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Headers', '*')
-        self.send_header('Access-Control-Allow-Methods', '*')
-    def _json_response(self, data, status=200):
+        self.send_header('Access-Control-Allow-Headers', 'Authorization, Content-Type, Mcp-Session-Id')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+
+    def _json_response(self, data, status=200, extra_headers=None):
         self.send_response(status)
         self._cors()
         self.send_header('Content-Type', 'application/json')
         self.send_header('Mcp-Session-Id', SESSION_ID)
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
+
+    def _require_auth(self):
+        if not MCP_AUTH_TOKEN:
+            self._json_response(
+                {"error": "MCP_AUTH_TOKEN is not configured"},
+                status=503,
+            )
+            return False
+
+        auth_header = self.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            self._json_response(
+                {"error": "Unauthorized"},
+                status=401,
+                extra_headers={"WWW-Authenticate": "Bearer"},
+            )
+            return False
+
+        supplied_token = auth_header[7:].strip()
+        if not supplied_token or not hmac.compare_digest(supplied_token, MCP_AUTH_TOKEN):
+            self._json_response(
+                {"error": "Unauthorized"},
+                status=401,
+                extra_headers={"WWW-Authenticate": "Bearer"},
+            )
+            return False
+
+        return True
+
     def _handle_mcp(self):
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length)) if length else {}
@@ -263,6 +301,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         self._json_response(result)
+
     def _handle_sse(self):
         self.send_response(200)
         self._cors()
@@ -278,6 +317,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
         except:
             pass
+
     def log_message(self, format, *args):
         pass
 
@@ -286,6 +326,7 @@ class ThreadedHTTPServer(HTTPServer):
         t = threading.Thread(target=self._handle, args=(request, client_address))
         t.daemon = True
         t.start()
+
     def _handle(self, request, client_address):
         try:
             self.finish_request(request, client_address)
@@ -297,5 +338,6 @@ class ThreadedHTTPServer(HTTPServer):
 if __name__ == '__main__':
     print("NetEase Music MCP v2 on port " + str(PORT))
     print("Tools: " + str(len(TOOLS)))
+    print("Bearer auth: " + ("enabled" if MCP_AUTH_TOKEN else "MISSING - MCP endpoints will reject requests"))
     server = ThreadedHTTPServer(('0.0.0.0', PORT), MCPHandler)
     server.serve_forever()
